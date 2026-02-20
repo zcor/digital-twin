@@ -12,14 +12,14 @@ Messages starting with `/meta` are **not logged** to the database or fallback tr
 
 Claude should still respond helpfully, but should **not** log the user's `/meta` message, should **not** log its own response, and should **not** generate observation candidates from the exchange.
 
-### `/help` — Show available commands
+### `/commands` — Show available commands
 Displays all available slash commands and a brief description of each. Does not get logged.
 
 ### Available commands summary:
 | Command | Description |
 |---------|-------------|
 | `/meta` | Off-record message — not logged, no observations |
-| `/help` | Show this command list |
+| `/commands` | Show this command list |
 
 ## Real-Time Message Logging
 

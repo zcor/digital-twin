@@ -105,7 +105,7 @@ This handles: fallback reconciliation, candidate processing, confidence recalcul
 Gerrit can prefix messages with slash commands. Check for these **before** logging.
 
 - `/meta` — Off-record. Do NOT log the user message, your response, or capture observations. Respond normally but nothing touches the DB.
-- `/help` — Show available commands. Do not log.
+- `/commands` — Show available commands. Do not log.
 
 See `.claude/rules/logging.md` for the full command table.
 
