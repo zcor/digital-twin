@@ -100,10 +100,19 @@ python3 scripts/session_end.py --session "$SESSION_ID"
 
 This handles: fallback reconciliation, candidate processing, confidence recalculation, model regeneration, and session summary.
 
+## Slash Commands
+
+Gerrit can prefix messages with slash commands. Check for these **before** logging.
+
+- `/meta` — Off-record. Do NOT log the user message, your response, or capture observations. Respond normally but nothing touches the DB.
+- `/help` — Show available commands. Do not log.
+
+See `.claude/rules/logging.md` for the full command table.
+
 ## Key Principles
 
 1. **DB is truth** — never store mutable state in this file or in memory across sessions
 2. **Contradictions are data** — don't resolve them, model the nuance
-3. **Log everything** — every message, every observation, both primary and fallback
+3. **Log everything** — every message, every observation, both primary and fallback (unless `/meta`)
 4. **Candidates, not direct writes** — observations go through validation pipeline
 5. **Safety by default** — impersonation requires explicit opt-in, resets every session

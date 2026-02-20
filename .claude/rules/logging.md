@@ -1,14 +1,36 @@
 # Logging Protocol
 
+## Slash Commands
+
+Gerrit can use slash commands at the start of a message. These are processed before logging.
+
+### `/meta` — Off-record message
+Messages starting with `/meta` are **not logged** to the database or fallback transcript. Use for:
+- Asking Claude to build or fix something in the system
+- Technical questions about the twin infrastructure
+- Anything Gerrit doesn't want captured as personality data
+
+Claude should still respond helpfully, but should **not** log the user's `/meta` message, should **not** log its own response, and should **not** generate observation candidates from the exchange.
+
+### `/help` — Show available commands
+Displays all available slash commands and a brief description of each. Does not get logged.
+
+### Available commands summary:
+| Command | Description |
+|---------|-------------|
+| `/meta` | Off-record message — not logged, no observations |
+| `/help` | Show this command list |
+
 ## Real-Time Message Logging
 
-Every message — user and assistant — must be logged immediately via `log_message.py`. Use `--content-stdin` to avoid shell quoting issues with special characters.
+Every message — user and assistant — must be logged immediately via `log_message.py`, **unless the message starts with a slash command that suppresses logging.** Use `--content-stdin` to avoid shell quoting issues with special characters.
 
 ### Flow per message:
 1. Receive/generate message
-2. Pipe content to `log_message.py` via stdin
-3. Capture returned `{"message_id": N, "uuid": "..."}` for reference
-4. If logging fails, note the error but continue the conversation — the fallback transcript provides recovery
+2. **Check for slash commands** — if present, handle accordingly and skip logging
+3. Pipe content to `log_message.py` via stdin
+4. Capture returned `{"message_id": N, "uuid": "..."}` for reference
+5. If logging fails, note the error but continue the conversation — the fallback transcript provides recovery
 
 ## Observation Candidate Schema (V1)
 
