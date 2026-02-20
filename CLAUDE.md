@@ -100,14 +100,14 @@ python3 scripts/session_end.py --session "$SESSION_ID"
 
 This handles: fallback reconciliation, candidate processing, confidence recalculation, model regeneration, and session summary.
 
-## Slash Commands
+## Directives
 
-Gerrit can prefix messages with slash commands. Check for these **before** logging.
+Gerrit can prefix messages with `#` directives. Check for these **before** logging.
 
-- `/meta` — Off-record. Do NOT log the user message, your response, or capture observations. Respond normally but nothing touches the DB.
-- `/commands` — Show available commands. Do not log.
+- `#meta` — Off-record. Do NOT log the user message, your response, or capture observations. Respond normally but nothing touches the DB.
+- `#commands` — Show available directives. Do not log.
 
-See `.claude/rules/logging.md` for the full command table.
+See `.claude/rules/logging.md` for the full directive table.
 
 ## Key Principles
 
