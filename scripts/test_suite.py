@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
 
 SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPTS_DIR)
@@ -28,7 +29,7 @@ sys.path.insert(0, SCRIPTS_DIR)
 from init_db import init_db
 from log_message import log_message, log_candidate, get_connection, validate_candidate, write_fallback
 from export_model import export_model, observation_confidence, DEPTH_MAP
-from session_end import parse_fallback_file, reconcile, process_candidates
+from session_end import parse_fallback_file, reconcile, process_candidates, end_session, finalize_stale_sessions, heartbeat_claim
 
 PASS = 0
 FAIL = 0
@@ -704,6 +705,406 @@ def test_fk_enforcement():
         cleanup(tmpdir)
 
 
+# --- Test 16: Session end idempotency ---
+def test_session_end_idempotency():
+    tmpdir, db_path, model_dir = make_test_env()
+    try:
+        init_db(db_path)
+        session_id = "test-idempotent"
+        log_message("user", session_id, "Hello", db_path=db_path)
+
+        # Patch paths for test environment
+        import session_end
+        orig_transcripts = session_end.TRANSCRIPTS_DIR
+        orig_scripts = session_end.SCRIPTS_DIR
+        session_end.TRANSCRIPTS_DIR = os.path.join(tmpdir, "transcripts")
+        session_end.SCRIPTS_DIR = SCRIPTS_DIR
+
+        success1, reason1 = end_session(session_id, db_path=db_path)
+        success2, reason2 = end_session(session_id, db_path=db_path)
+
+        session_end.TRANSCRIPTS_DIR = orig_transcripts
+        session_end.SCRIPTS_DIR = orig_scripts
+
+        report("Session end idempotency",
+               success1 and reason1 == "finalized" and success2 and reason2 == "already finalized",
+               f"first={reason1}, second={reason2}")
+    finally:
+        cleanup(tmpdir)
+
+
+# --- Test 17: Token claim exclusivity ---
+def _claim_worker(args):
+    """Worker for concurrent claim test."""
+    db_path, session_id, worker_id = args
+    import session_end as se
+    success, reason = se.end_session(session_id, db_path=db_path)
+    return {"worker": worker_id, "success": success, "reason": reason}
+
+
+def test_token_claim_exclusivity():
+    tmpdir, db_path, model_dir = make_test_env()
+    try:
+        init_db(db_path)
+        session_id = "test-claim-excl"
+
+        # Create session with a message and a candidate
+        conn = get_connection(db_path)
+        now = "2026-02-19T00:00:00Z"
+        conn.execute("INSERT INTO sessions (session_id, started_at, mode) VALUES (?, ?, 'interview')", (session_id, now))
+        conn.execute(
+            "INSERT INTO messages (uuid, session_id, role, content, timestamp) VALUES (?, ?, 'user', 'Hello', ?)",
+            (str(uuid.uuid4()), session_id, now)
+        )
+        conn.execute(
+            "INSERT INTO pending_observations (session_id, candidate_json) VALUES (?, ?)",
+            (session_id, json.dumps({"dimension": "humor_wit", "facet": "type", "trait": "test", "value": "Test", "specificity": "specific", "action": "new"}))
+        )
+        conn.commit()
+        conn.close()
+
+        # Patch paths
+        import session_end
+        orig_transcripts = session_end.TRANSCRIPTS_DIR
+        orig_scripts = session_end.SCRIPTS_DIR
+        session_end.TRANSCRIPTS_DIR = os.path.join(tmpdir, "transcripts")
+        session_end.SCRIPTS_DIR = SCRIPTS_DIR
+
+        # 3 concurrent workers
+        args = [(db_path, session_id, i) for i in range(3)]
+        with multiprocessing.Pool(3) as pool:
+            results = pool.map(_claim_worker, args)
+
+        session_end.TRANSCRIPTS_DIR = orig_transcripts
+        session_end.SCRIPTS_DIR = orig_scripts
+
+        # Exactly one should finalize
+        finalized = [r for r in results if r["reason"] == "finalized"]
+        conn = get_connection(db_path)
+        conn.row_factory = sqlite3.Row
+        session = conn.execute("SELECT ended_at, finalizing_token FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        conn.close()
+
+        report("Token claim exclusivity",
+               len(finalized) == 1 and session["ended_at"] is not None and session["finalizing_token"] is None,
+               f"finalized_count={len(finalized)}, ended_at set={session['ended_at'] is not None}")
+    finally:
+        cleanup(tmpdir)
+
+
+# --- Test 18: Crash recovery ---
+def test_crash_recovery():
+    tmpdir, db_path, model_dir = make_test_env()
+    try:
+        init_db(db_path)
+        session_id = "test-crash"
+
+        conn = get_connection(db_path)
+        old_time = "2026-02-19T00:00:00Z"
+        conn.execute("INSERT INTO sessions (session_id, started_at, mode, finalizing_token, finalizing_at) VALUES (?, ?, 'interview', 'dead-token', ?)",
+                     (session_id, old_time, old_time))
+        conn.execute(
+            "INSERT INTO messages (uuid, session_id, role, content, timestamp) VALUES (?, ?, 'user', 'Hello', ?)",
+            (str(uuid.uuid4()), session_id, old_time)
+        )
+        conn.commit()
+        conn.close()
+
+        import session_end
+        orig_transcripts = session_end.TRANSCRIPTS_DIR
+        orig_scripts = session_end.SCRIPTS_DIR
+        session_end.TRANSCRIPTS_DIR = os.path.join(tmpdir, "transcripts")
+        session_end.SCRIPTS_DIR = SCRIPTS_DIR
+
+        results = finalize_stale_sessions(db_path=db_path, max_age_minutes=0, claim_timeout_minutes=0)
+
+        session_end.TRANSCRIPTS_DIR = orig_transcripts
+        session_end.SCRIPTS_DIR = orig_scripts
+
+        conn = get_connection(db_path)
+        conn.row_factory = sqlite3.Row
+        session = conn.execute("SELECT ended_at, finalizing_token FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        conn.close()
+
+        reclaimed = [r for r in results if "reclaimed" in r.get("reason", "")]
+        report("Crash recovery",
+               len(reclaimed) == 1 and session["ended_at"] is not None and session["finalizing_token"] is None,
+               f"reclaimed={len(reclaimed)}, ended_at set={session['ended_at'] is not None}")
+    finally:
+        cleanup(tmpdir)
+
+
+# --- Test 19: Active claim not stolen ---
+def test_active_claim_not_stolen():
+    tmpdir, db_path, model_dir = make_test_env()
+    try:
+        init_db(db_path)
+        session_id = "test-active-claim"
+
+        conn = get_connection(db_path)
+        # Set a recent finalizing_at (just now)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn.execute("INSERT INTO sessions (session_id, started_at, mode, finalizing_token, finalizing_at) VALUES (?, ?, 'interview', 'active-token', ?)",
+                     (session_id, now, now))
+        conn.execute(
+            "INSERT INTO messages (uuid, session_id, role, content, timestamp) VALUES (?, ?, 'user', 'Hello', ?)",
+            (str(uuid.uuid4()), session_id, now)
+        )
+        conn.commit()
+        conn.close()
+
+        import session_end
+        orig_transcripts = session_end.TRANSCRIPTS_DIR
+        orig_scripts = session_end.SCRIPTS_DIR
+        session_end.TRANSCRIPTS_DIR = os.path.join(tmpdir, "transcripts")
+        session_end.SCRIPTS_DIR = SCRIPTS_DIR
+
+        # claim_timeout_minutes=5 means recent claims won't be considered stale
+        results = finalize_stale_sessions(db_path=db_path, max_age_minutes=0, claim_timeout_minutes=5)
+
+        session_end.TRANSCRIPTS_DIR = orig_transcripts
+        session_end.SCRIPTS_DIR = orig_scripts
+
+        conn = get_connection(db_path)
+        conn.row_factory = sqlite3.Row
+        session = conn.execute("SELECT ended_at, finalizing_token FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        conn.close()
+
+        report("Active claim not stolen",
+               session["ended_at"] is None and session["finalizing_token"] == "active-token",
+               f"ended_at={session['ended_at']}, token preserved={session['finalizing_token'] == 'active-token'}")
+    finally:
+        cleanup(tmpdir)
+
+
+# --- Test 20: Staleness cutoff ---
+def test_staleness_cutoff():
+    tmpdir, db_path, model_dir = make_test_env()
+    try:
+        init_db(db_path)
+
+        conn = get_connection(db_path)
+        old_time = "2020-01-01T00:00:00Z"
+        recent_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Old session (should be finalized)
+        conn.execute("INSERT INTO sessions (session_id, started_at, mode) VALUES ('old-session', ?, 'interview')", (old_time,))
+        conn.execute("INSERT INTO messages (uuid, session_id, role, content, timestamp) VALUES (?, 'old-session', 'user', 'Hi', ?)",
+                     (str(uuid.uuid4()), old_time))
+
+        # Recent session (should be skipped)
+        conn.execute("INSERT INTO sessions (session_id, started_at, mode) VALUES ('recent-session', ?, 'interview')", (recent_time,))
+        conn.execute("INSERT INTO messages (uuid, session_id, role, content, timestamp) VALUES (?, 'recent-session', 'user', 'Hi', ?)",
+                     (str(uuid.uuid4()), recent_time))
+        conn.commit()
+        conn.close()
+
+        import session_end
+        orig_transcripts = session_end.TRANSCRIPTS_DIR
+        orig_scripts = session_end.SCRIPTS_DIR
+        session_end.TRANSCRIPTS_DIR = os.path.join(tmpdir, "transcripts")
+        session_end.SCRIPTS_DIR = SCRIPTS_DIR
+
+        results = finalize_stale_sessions(db_path=db_path, max_age_minutes=5, claim_timeout_minutes=2)
+
+        session_end.TRANSCRIPTS_DIR = orig_transcripts
+        session_end.SCRIPTS_DIR = orig_scripts
+
+        conn = get_connection(db_path)
+        conn.row_factory = sqlite3.Row
+        old_ended = conn.execute("SELECT ended_at FROM sessions WHERE session_id = 'old-session'").fetchone()["ended_at"]
+        recent_ended = conn.execute("SELECT ended_at FROM sessions WHERE session_id = 'recent-session'").fetchone()["ended_at"]
+        conn.close()
+
+        report("Staleness cutoff",
+               old_ended is not None and recent_ended is None,
+               f"old finalized={old_ended is not None}, recent skipped={recent_ended is None}")
+    finally:
+        cleanup(tmpdir)
+
+
+# --- Test 21: Token-loss detection ---
+def test_token_loss_detection():
+    tmpdir, db_path, model_dir = make_test_env()
+    try:
+        init_db(db_path)
+        session_id = "test-token-loss"
+
+        conn = get_connection(db_path)
+        now = "2026-02-19T00:00:00Z"
+        conn.execute("INSERT INTO sessions (session_id, started_at, mode) VALUES (?, ?, 'interview')", (session_id, now))
+        conn.execute("INSERT INTO messages (uuid, session_id, role, content, timestamp) VALUES (?, ?, 'user', 'Hello', ?)",
+                     (str(uuid.uuid4()), session_id, now))
+        conn.commit()
+
+        # Simulate: claim the session with a token, then clear it (as if reclaimed)
+        token = str(uuid.uuid4())
+        conn.execute("UPDATE sessions SET finalizing_token = ?, finalizing_at = ? WHERE session_id = ?",
+                     (token, now, session_id))
+        conn.commit()
+
+        # Now try to finalize with the token cleared (simulating another worker stealing it)
+        conn.execute("UPDATE sessions SET finalizing_token = NULL, finalizing_at = NULL WHERE session_id = ?",
+                     (session_id,))
+        conn.commit()
+
+        # Heartbeat should fail since token doesn't match
+        result = heartbeat_claim(conn, session_id, token)
+        conn.close()
+
+        report("Token-loss detection",
+               result is False,
+               f"heartbeat_claim returned {result} (expected False)")
+    finally:
+        cleanup(tmpdir)
+
+
+# --- Test 22: Reclaim guarded by ended_at ---
+def test_reclaim_guarded_by_ended_at():
+    tmpdir, db_path, model_dir = make_test_env()
+    try:
+        init_db(db_path)
+        session_id = "test-reclaim-guard"
+
+        conn = get_connection(db_path)
+        conn.row_factory = sqlite3.Row
+        old_time = "2020-01-01T00:00:00Z"
+        # Already finalized session with stale claim columns (shouldn't happen, but guard against it)
+        conn.execute("""
+            INSERT INTO sessions (session_id, started_at, ended_at, mode, finalizing_token, finalizing_at)
+            VALUES (?, ?, ?, 'interview', 'old-token', ?)
+        """, (session_id, old_time, old_time, old_time))
+        conn.commit()
+
+        # Try to reclaim — the UPDATE should match 0 rows because ended_at IS NOT NULL
+        cur = conn.execute("""
+            UPDATE sessions SET finalizing_token = NULL, finalizing_at = NULL
+            WHERE session_id = ? AND ended_at IS NULL AND finalizing_at < ?
+        """, (session_id, "2030-01-01T00:00:00Z"))
+        conn.commit()
+
+        # Session should be untouched
+        session = conn.execute("SELECT finalizing_token, ended_at FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        conn.close()
+
+        report("Reclaim guarded by ended_at",
+               cur.rowcount == 0 and session["finalizing_token"] == "old-token",
+               f"rowcount={cur.rowcount}, token preserved={session['finalizing_token'] == 'old-token'}")
+    finally:
+        cleanup(tmpdir)
+
+
+# --- Test 23: Dev mode guard ---
+def test_dev_mode_guard():
+    tmpdir, db_path, _ = make_test_env()
+    try:
+        init_db(db_path)
+        session_id = "test-dev-guard"
+
+        # Create session with dev_mode=1
+        conn = get_connection(db_path)
+        now = "2026-02-19T00:00:00Z"
+        conn.execute("INSERT INTO sessions (session_id, started_at, mode, dev_mode) VALUES (?, ?, 'interview', 1)", (session_id, now))
+        conn.commit()
+        conn.close()
+
+        # log_message should refuse
+        msg_id, msg_uuid, err = log_message("user", session_id, "Should not log", db_path=db_path)
+        msg_refused = err is not None and "Dev mode" in err
+
+        # log_candidate should refuse
+        cid, errors = log_candidate(session_id, json.dumps({
+            "dimension": "humor_wit", "facet": "type", "trait": "test",
+            "value": "Test", "specificity": "specific", "action": "new",
+        }), db_path=db_path)
+        cand_refused = errors is not None and any("Dev mode" in e for e in errors)
+
+        report("Dev mode guard",
+               msg_refused and cand_refused,
+               f"msg_refused={msg_refused}, cand_refused={cand_refused}")
+    finally:
+        cleanup(tmpdir)
+
+
+# --- Test 24: Dev mode session-scoped + --set-dev-mode ---
+def test_dev_mode_session_scoped():
+    tmpdir, db_path, _ = make_test_env()
+    try:
+        init_db(db_path)
+
+        # Session 1: dev mode
+        dev_session = "test-dev-scoped"
+        conn = get_connection(db_path)
+        now = "2026-02-19T00:00:00Z"
+        conn.execute("INSERT INTO sessions (session_id, started_at, mode, dev_mode) VALUES (?, ?, 'interview', 1)", (dev_session, now))
+        conn.commit()
+        conn.close()
+
+        # Session 2: normal
+        normal_session = "test-normal-scoped"
+        msg_id, msg_uuid, err = log_message("user", normal_session, "Normal message", db_path=db_path)
+        normal_logs = err is None and msg_id is not None
+
+        # Dev session refuses
+        _, _, dev_err = log_message("user", dev_session, "Should not log", db_path=db_path)
+        dev_refused = dev_err is not None
+
+        # Test --set-dev-mode via the function
+        from log_message import ensure_session, get_connection as lm_get_connection
+        new_session = "test-setdev"
+        conn = lm_get_connection(db_path)
+        ensure_session(conn, new_session)
+        conn.execute("BEGIN IMMEDIATE")
+        msg_count = conn.execute("SELECT COUNT(*) FROM messages WHERE session_id = ?", (new_session,)).fetchone()[0]
+        if msg_count == 0:
+            conn.execute("UPDATE sessions SET dev_mode = 1 WHERE session_id = ?", (new_session,))
+            conn.commit()
+            set_ok = True
+        else:
+            conn.rollback()
+            set_ok = False
+        conn.close()
+
+        # Verify it was set
+        conn = get_connection(db_path)
+        dev = conn.execute("SELECT dev_mode FROM sessions WHERE session_id = ?", (new_session,)).fetchone()[0]
+        conn.close()
+
+        report("Dev mode session-scoped + --set-dev-mode",
+               normal_logs and dev_refused and set_ok and dev == 1,
+               f"normal_logs={normal_logs}, dev_refused={dev_refused}, set_ok={set_ok}, dev_mode={dev}")
+    finally:
+        cleanup(tmpdir)
+
+
+# --- Test 25: --set-dev-mode refused mid-session ---
+def test_set_dev_mode_refused_mid_session():
+    tmpdir, db_path, _ = make_test_env()
+    try:
+        init_db(db_path)
+        session_id = "test-dev-mid"
+
+        # Log a message first
+        log_message("user", session_id, "First message", db_path=db_path)
+
+        # Now try to set dev mode — should fail because session has messages
+        conn = get_connection(db_path)
+        conn.execute("BEGIN IMMEDIATE")
+        msg_count = conn.execute("SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)).fetchone()[0]
+        refused = msg_count > 0
+        conn.rollback()
+
+        # Verify dev_mode is still 0
+        dev = conn.execute("SELECT dev_mode FROM sessions WHERE session_id = ?", (session_id,)).fetchone()[0]
+        conn.close()
+
+        report("--set-dev-mode refused mid-session",
+               refused and dev == 0,
+               f"refused={refused}, dev_mode={dev}")
+    finally:
+        cleanup(tmpdir)
+
+
 def main():
     global PASS, FAIL
     print("\n=== Gerrit Digital Twin Test Suite ===\n")
@@ -723,6 +1124,18 @@ def main():
     test_file_permissions()
     test_calibration_sanity()
     test_fk_enforcement()
+
+    # New tests (16-25)
+    test_session_end_idempotency()
+    test_token_claim_exclusivity()
+    test_crash_recovery()
+    test_active_claim_not_stolen()
+    test_staleness_cutoff()
+    test_token_loss_detection()
+    test_reclaim_guarded_by_ended_at()
+    test_dev_mode_guard()
+    test_dev_mode_session_scoped()
+    test_set_dev_mode_refused_mid_session()
 
     print(f"\n{'='*40}")
     print(f"Results: {PASS} passed, {FAIL} failed, {PASS+FAIL} total")

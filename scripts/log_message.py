@@ -178,13 +178,21 @@ def validate_candidate(candidate_json_str):
 
 
 def log_message(role, session_id, content, msg_uuid=None, db_path=None):
-    """Log a message to DB and fallback transcript. Returns (message_id, uuid)."""
+    """Log a message to DB and fallback transcript. Returns (message_id, uuid, error)."""
     conn = get_connection(db_path)
     msg_uuid = msg_uuid or str(uuid_mod.uuid4())
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     try:
         ensure_session(conn, session_id)
+
+        # Dev mode guard (session-scoped, after session creation)
+        dev = conn.execute(
+            "SELECT dev_mode FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()[0]
+        if dev:
+            conn.close()
+            return None, None, "Dev mode active for this session — logging suppressed"
 
         # Impersonation guard for assistant messages
         if role == "assistant":
@@ -235,6 +243,14 @@ def log_candidate(session_id, candidate_json_str, db_path=None):
     try:
         ensure_session(conn, session_id)
 
+        # Dev mode guard
+        dev = conn.execute(
+            "SELECT dev_mode FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()[0]
+        if dev:
+            conn.close()
+            return None, ["Dev mode active for this session — logging suppressed"]
+
         def do_insert():
             conn.execute(
                 "INSERT INTO pending_observations (session_id, candidate_json) VALUES (?, ?)",
@@ -260,9 +276,32 @@ def main():
     parser.add_argument("--content-stdin", action="store_true", help="Read content from stdin")
     parser.add_argument("--uuid", help="Supply UUID externally (for testing/replay)")
     parser.add_argument("--observation-candidate", action="store_true", help="Log observation candidate instead of message")
+    parser.add_argument("--set-dev-mode", action="store_true", help="Enable dev mode for session (must be first message)")
     parser.add_argument("--db", help="Override database path")
 
     args = parser.parse_args()
+
+    if args.set_dev_mode:
+        if not args.session:
+            print(json.dumps({"error": "--session required with --set-dev-mode"}))
+            sys.exit(1)
+        conn = get_connection(args.db)
+        ensure_session(conn, args.session)
+        # Atomic: set dev_mode only if zero messages exist
+        conn.execute("BEGIN IMMEDIATE")
+        msg_count = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?", (args.session,)
+        ).fetchone()[0]
+        if msg_count > 0:
+            conn.rollback()
+            conn.close()
+            print(json.dumps({"error": "Cannot enable dev mode — session already has messages. #dev must be the first message."}))
+            sys.exit(1)
+        conn.execute("UPDATE sessions SET dev_mode = 1 WHERE session_id = ?", (args.session,))
+        conn.commit()
+        conn.close()
+        print(json.dumps({"dev_mode": True, "session_id": args.session}))
+        sys.exit(0)
 
     if not args.content_stdin:
         print(json.dumps({"error": "--content-stdin is required"}))

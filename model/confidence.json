@@ -6,32 +6,26 @@
     "values_opinions dimension at 0.00, needs >= 0.30 for calibration",
     "knowledge_expertise dimension at 0.00, needs >= 0.30 for calibration",
     "emotional_relational dimension at 0.00, needs >= 0.30 for calibration",
-    "cognitive_decision_making dimension at 0.03, needs >= 0.30 for calibration"
+    "cognitive_decision_making dimension at 0.00, needs >= 0.30 for calibration"
   ],
   "contradiction_rate": 0.0,
   "exemplar_ratio": 0.0,
-  "generated_at": "2026-02-20T03:17:08Z",
-  "overall_readiness": 0.1513,
+  "generated_at": "2026-02-20T04:09:19Z",
+  "overall_readiness": 0.15,
   "per_dimension": {
     "cognitive_decision_making": {
-      "confidence": 0.0315,
+      "confidence": 0.0,
       "contradiction_count": 0,
-      "coverage": 0.6,
-      "facets": {
-        "feedback_style": 0.0954,
-        "tool_usage": 0.0715,
-        "worldview": 0.0954
-      },
-      "min_facet_confidence": 0.0715
+      "coverage": 0.0,
+      "facets": {},
+      "min_facet_confidence": 0.0
     },
     "communication_style": {
-      "confidence": 0.0015,
+      "confidence": 0.0,
       "contradiction_count": 0,
-      "coverage": 0.125,
-      "facets": {
-        "tone": 0.0954
-      },
-      "min_facet_confidence": 0.0954
+      "coverage": 0.0,
+      "facets": {},
+      "min_facet_confidence": 0.0
     },
     "emotional_relational": {
       "confidence": 0.0,
@@ -55,13 +49,11 @@
       "min_facet_confidence": 0.0
     },
     "values_opinions": {
-      "confidence": 0.0027,
+      "confidence": 0.0,
       "contradiction_count": 0,
-      "coverage": 0.1667,
-      "facets": {
-        "technology_preferences": 0.0954
-      },
-      "min_facet_confidence": 0.0954
+      "coverage": 0.0,
+      "facets": {},
+      "min_facet_confidence": 0.0
     },
     "vocabulary_language": {
       "confidence": 0.0,
@@ -75,14 +67,14 @@
   "ready_for_impersonation": false,
   "schema_version": 1,
   "strongest_dimensions": [
-    "communication_style",
-    "values_opinions",
+    "knowledge_expertise",
+    "emotional_relational",
     "cognitive_decision_making"
   ],
   "vocabulary_score": 0.0,
   "weakest_dimensions": [
+    "communication_style",
     "vocabulary_language",
-    "humor_wit",
-    "knowledge_expertise"
+    "humor_wit"
   ]
 }

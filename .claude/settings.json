@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '=== Digital Twin ===\nDirectives: #meta (off-record) | #dev (dev mode) | #commands (list all)'"
+          }
+        ]
+      }
+    ]
+  }
+}

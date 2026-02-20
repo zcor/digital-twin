@@ -35,9 +35,24 @@ def init_db(db_path=None):
             topics_covered JSON,
             new_observations INT DEFAULT 0,
             updated_observations INT DEFAULT 0,
-            session_summary TEXT
+            session_summary TEXT,
+            dev_mode BOOLEAN NOT NULL DEFAULT 0,
+            finalizing_token TEXT,
+            finalizing_at TEXT
         )
     """)
+
+    # Idempotent migration for existing DBs
+    migrations = [
+        "ALTER TABLE sessions ADD COLUMN dev_mode BOOLEAN NOT NULL DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN finalizing_token TEXT",
+        "ALTER TABLE sessions ADD COLUMN finalizing_at TEXT",
+    ]
+    for sql in migrations:
+        try:
+            cur.execute(sql)
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
     # --- messages ---
     cur.execute("""

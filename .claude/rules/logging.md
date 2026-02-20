@@ -14,6 +14,20 @@ Example: `#meta can you fix the export script to handle empty facets?`
 
 Claude should still respond helpfully, but should **not** log the user's `#meta` message, should **not** log its own response, and should **not** generate observation candidates from the exchange.
 
+### `#dev` — Dev mode for entire session
+Activates dev mode for the current session. **Must be the very first message** — the system refuses if any messages have already been logged. Once active:
+- All `log_message` and `log_candidate` calls for this session return early (logging suppressed)
+- Other sessions are unaffected (dev mode is session-scoped)
+- The session still exists in the DB with `dev_mode=1`
+- Useful for build/fix sessions where Gerrit is working on the twin infrastructure
+
+Example: `#dev` (as the first message in a session)
+
+When Claude sees `#dev`, it should:
+1. Run `python3 scripts/log_message.py --set-dev-mode --session "$SESSION_ID"`
+2. Skip the interview protocol entirely — this is a development session
+3. Not log any messages or observations for the rest of the session
+
 ### `#commands` — Show available directives
 Displays all available directives and a brief description of each. Does not get logged.
 
@@ -21,6 +35,7 @@ Displays all available directives and a brief description of each. Does not get 
 | Directive | Description |
 |-----------|-------------|
 | `#meta` | Off-record message — not logged, no observations |
+| `#dev` | Dev mode for entire session. Must be first message. Enforced in code — refuses if session has messages. |
 | `#commands` | Show this directive list |
 
 ## Real-Time Message Logging

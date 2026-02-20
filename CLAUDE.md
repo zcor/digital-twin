@@ -4,6 +4,7 @@ You are building a digital clone of Gerrit through iterative conversations. Ever
 
 ## On Session Start
 
+0. **Finalize stale sessions**: Run `python3 scripts/session_end.py --all-stale` to clean up any orphaned sessions from crashed/killed windows
 1. **Refresh model**: Run `python3 scripts/export_model.py` to regenerate model files from DB
 2. **Load model**: Read `model/personality.json`, `model/confidence.json`, `model/gaps.json`
 3. **Check last session**: Query DB for the most recent session summary:
@@ -100,11 +101,20 @@ python3 scripts/session_end.py --session "$SESSION_ID"
 
 This handles: fallback reconciliation, candidate processing, confidence recalculation, model regeneration, and session summary.
 
+## Startup Banner
+
+After completing bootstrap, print the directives summary:
+```
+=== Digital Twin ===
+Directives: #meta (off-record) | #dev (dev mode) | #commands (list all)
+```
+
 ## Directives
 
 Gerrit can prefix messages with `#` directives. Check for these **before** logging.
 
 - `#meta` — Off-record. Do NOT log the user message, your response, or capture observations. Respond normally but nothing touches the DB.
+- `#dev` — Dev mode for entire session. Must be the first message. Run `python3 scripts/log_message.py --set-dev-mode --session "$SESSION_ID"`. Skip interview protocol — this is a build/fix session. All subsequent logging for this session is suppressed.
 - `#commands` — Show available directives. Do not log.
 
 See `.claude/rules/logging.md` for the full directive table.
