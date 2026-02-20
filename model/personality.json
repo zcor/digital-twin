@@ -1,0 +1,34 @@
+{
+  "dimensions": {
+    "cognitive_decision_making": {
+      "_rationale": "No observations yet for cognitive decision making",
+      "_status": "unknown"
+    },
+    "communication_style": {
+      "_rationale": "No observations yet for communication style",
+      "_status": "unknown"
+    },
+    "emotional_relational": {
+      "_rationale": "No observations yet for emotional relational",
+      "_status": "unknown"
+    },
+    "humor_wit": {
+      "_rationale": "No observations yet for humor wit",
+      "_status": "unknown"
+    },
+    "knowledge_expertise": {
+      "_rationale": "No observations yet for knowledge expertise",
+      "_status": "unknown"
+    },
+    "values_opinions": {
+      "_rationale": "No observations yet for values opinions",
+      "_status": "unknown"
+    },
+    "vocabulary_language": {
+      "_rationale": "No observations yet for vocabulary language",
+      "_status": "unknown"
+    }
+  },
+  "generated_at": "2026-02-20T03:17:08Z",
+  "schema_version": 1
+}
