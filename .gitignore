@@ -6,3 +6,4 @@ __pycache__/
 db/gerrit.db
 transcripts/fallback/
 transcripts/summaries/
+model/system_prompt.txt
