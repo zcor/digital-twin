@@ -115,14 +115,19 @@ def process_candidates(conn, session_id, heartbeat_fn=None):
 
     If heartbeat_fn is provided, it is called after each candidate. If it
     returns False (claim lost), processing stops early and returns partial results.
+
+    Returns (new_count, updated_count, vocab_count, exemplar_count, results).
+    new_count/updated_count are observation-only. vocab_count/exemplar_count are separate.
     """
     candidates = conn.execute(
         "SELECT id, candidate_json FROM pending_observations WHERE session_id = ? AND status = 'pending'",
         (session_id,)
     ).fetchall()
 
-    new_count = 0
-    updated_count = 0
+    new_count = 0       # observations only
+    updated_count = 0   # observations only
+    vocab_count = 0     # vocabulary entries
+    exemplar_count = 0  # exemplar entries
     results = []
 
     for cand in candidates:
@@ -221,6 +226,64 @@ def process_candidates(conn, session_id, heartbeat_fn=None):
                 conn.execute("UPDATE pending_observations SET status = 'accepted' WHERE id = ?", (cand["id"],))
                 results.append({"candidate_id": cand["id"], "action": "uncertain", "added_to_gaps": True})
 
+            elif action == "vocabulary":
+                term = data["term"]
+                normalized = term.lower().strip()
+                category = data["category"]
+                context = data.get("context", "")
+                frequency = data.get("frequency", "occasional")
+
+                existing = conn.execute(
+                    "SELECT id FROM vocabulary WHERE normalized_term = ?", (normalized,)
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        "UPDATE vocabulary SET session_count = session_count + 1 WHERE id = ?",
+                        (existing[0],)
+                    )
+                    vocab_count += 1
+                    conn.execute("UPDATE pending_observations SET status = 'accepted' WHERE id = ?", (cand["id"],))
+                    results.append({"candidate_id": cand["id"], "action": "vocabulary", "term": term, "updated": True})
+                else:
+                    conn.execute("""
+                        INSERT INTO vocabulary (term, normalized_term, category, frequency, context, first_observed, session_count)
+                        VALUES (?, ?, ?, ?, ?, ?, 1)
+                    """, (term, normalized, category, frequency, context, now))
+                    vocab_count += 1
+                    conn.execute("UPDATE pending_observations SET status = 'accepted' WHERE id = ?", (cand["id"],))
+                    results.append({"candidate_id": cand["id"], "action": "vocabulary", "term": term, "new": True})
+
+            elif action == "exemplar":
+                obs_id = data["observation_id"]
+                quote = data["quote"]
+                context = data.get("context", "")
+                significance = data.get("significance", "")
+                source_msg_id = data["source_message_ids"][0]
+
+                existing_obs = conn.execute("SELECT id FROM observations WHERE id = ?", (obs_id,)).fetchone()
+                existing_msg = conn.execute("SELECT id FROM messages WHERE id = ?", (source_msg_id,)).fetchone()
+                if not existing_obs or not existing_msg:
+                    conn.execute("UPDATE pending_observations SET status = 'rejected' WHERE id = ?", (cand["id"],))
+                    results.append({"candidate_id": cand["id"], "action": "exemplar",
+                                    "error": f"Observation {obs_id} or message {source_msg_id} not found"})
+                else:
+                    # Dedupe: skip if exact (observation_id, source_message_id, quote) already exists
+                    dupe = conn.execute("""
+                        SELECT id FROM exemplars
+                        WHERE observation_id = ? AND source_message_id = ? AND quote = ?
+                    """, (obs_id, source_msg_id, quote)).fetchone()
+                    if dupe:
+                        conn.execute("UPDATE pending_observations SET status = 'accepted' WHERE id = ?", (cand["id"],))
+                        results.append({"candidate_id": cand["id"], "action": "exemplar", "duplicate": True})
+                    else:
+                        conn.execute("""
+                            INSERT INTO exemplars (observation_id, source_message_id, quote, context, significance)
+                            VALUES (?, ?, ?, ?, ?)
+                        """, (obs_id, source_msg_id, quote, context, significance))
+                        exemplar_count += 1
+                        conn.execute("UPDATE pending_observations SET status = 'accepted' WHERE id = ?", (cand["id"],))
+                        results.append({"candidate_id": cand["id"], "action": "exemplar", "observation_id": obs_id})
+
         except Exception as e:
             conn.execute("UPDATE pending_observations SET status = 'rejected' WHERE id = ?", (cand["id"],))
             results.append({"candidate_id": cand["id"], "error": str(e)})
@@ -233,36 +296,105 @@ def process_candidates(conn, session_id, heartbeat_fn=None):
                 # Claim lost — stop processing, return partial results
                 break
 
-    return new_count, updated_count, results
+    return new_count, updated_count, vocab_count, exemplar_count, results
 
 
-def write_session_summary(session_id, reconciled, new_obs, updated_obs, candidate_results, conn):
-    """Write session summary markdown."""
+def extract_topics(session_id, candidate_results, conn):
+    """Extract topics_covered as a JSON array of snake_case dimension keys.
+
+    Primary: parse dimensions from accepted candidates for this session.
+    Fallback: keyword heuristic from user messages.
+    """
+    # Primary: parse dimensions from accepted candidates
+    accepted_ids = [r["candidate_id"] for r in candidate_results
+                    if r.get("action") in ("new", "confirm", "contradict", "uncertain")]
+    topics = []
+    if accepted_ids:
+        placeholders = ",".join("?" * len(accepted_ids))
+        rows = conn.execute(
+            f"SELECT candidate_json FROM pending_observations WHERE id IN ({placeholders})",
+            accepted_ids,
+        ).fetchall()
+        dims = set()
+        for row in rows:
+            data = json.loads(row[0])
+            dims.add(data["dimension"])
+        topics = sorted(dims)
+
+    # Fallback: keyword heuristic from user messages
+    if not topics:
+        user_msgs = conn.execute(
+            "SELECT content FROM messages WHERE session_id = ? AND role = 'user'",
+            (session_id,),
+        ).fetchall()
+        if user_msgs:
+            all_text = " ".join(m[0].lower() for m in user_msgs)
+            dimension_keywords = {
+                "communication_style": ["text", "write", "say", "talk", "message", "email"],
+                "vocabulary_language": ["word", "phrase", "slang", "jargon", "language"],
+                "humor_wit": ["joke", "funny", "humor", "laugh", "sarcas"],
+                "values_opinions": ["believe", "value", "opinion", "important", "matter"],
+                "knowledge_expertise": ["work", "career", "hobby", "skill", "know"],
+                "emotional_relational": ["feel", "friend", "relationship", "stress", "emotion"],
+                "cognitive_decision_making": ["decide", "think", "reason", "risk", "plan"],
+            }
+            for dim, keywords in dimension_keywords.items():
+                if any(kw in all_text for kw in keywords):
+                    topics.append(dim)
+
+    return topics
+
+
+def write_session_summary(session_id, reconciled, new_obs, updated_obs, vocab_count, exemplar_count, candidate_results, conn):
+    """Write session summary markdown and populate topics_covered."""
     summaries_dir = os.path.join(TRANSCRIPTS_DIR, "summaries")
     os.makedirs(summaries_dir, exist_ok=True)
 
     msg_count = conn.execute("SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)).fetchone()[0]
     session = conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
 
+    # Extract and store topics
+    topics = extract_topics(session_id, candidate_results, conn)
+    conn.execute("UPDATE sessions SET topics_covered = ? WHERE session_id = ?",
+                 (json.dumps(topics), session_id))
+
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Determine logging status (display-only, not stored in DB)
+    if msg_count > 0:
+        logging_status = "complete"
+    elif session["mode"] == "impersonation":
+        logging_status = "potential_logging_failure"
+    else:
+        logging_status = "empty_session"
+
     summary_lines = [
         f"# Session Summary: {session_id}",
         f"",
         f"**Started**: {session['started_at']}",
         f"**Ended**: {now}",
         f"**Mode**: {session['mode']}",
+        f"**Logging status**: {logging_status}",
         f"",
         f"## Statistics",
         f"- Messages logged: {msg_count}",
         f"- Messages reconciled from fallback: {reconciled}",
         f"- New observations: {new_obs}",
         f"- Updated observations: {updated_obs}",
+        f"- Vocabulary entries: {vocab_count}",
+        f"- Exemplar quotes: {exemplar_count}",
         f"",
         f"## Candidate Processing Results",
     ]
 
     for r in candidate_results:
         summary_lines.append(f"- {json.dumps(r)}")
+
+    if topics:
+        summary_lines.append("")
+        summary_lines.append("## Topics")
+        for t in topics:
+            summary_lines.append(f"- {t}")
 
     summary_text = "\n".join(summary_lines) + "\n"
 
@@ -331,6 +463,20 @@ def end_session(session_id, db_path=None):
         reconciled = reconcile(conn, session_id)
         print(f"  Reconciled {reconciled} messages from fallback")
 
+        # Check for zero-message sessions after reconciliation
+        post_recon_msg_count = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
+        ).fetchone()[0]
+        session_row = conn.execute(
+            "SELECT mode, impersonation_enabled FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if post_recon_msg_count == 0 and session_row["mode"] == "impersonation":
+            print(f"\n  WARNING: Impersonation session {session_id} has ZERO messages logged.")
+            print(f"  This likely means logging was skipped during the session.")
+            print(f"  To import a transcript retroactively:")
+            print(f"    python3 scripts/import_transcript.py --session {session_id} --content-stdin")
+            print()
+
         if not heartbeat_claim(conn, session_id, token):
             conn.close()
             return False, "claim lost during reconciliation"
@@ -339,16 +485,16 @@ def end_session(session_id, db_path=None):
         def heartbeat():
             return heartbeat_claim(conn, session_id, token)
 
-        new_obs, updated_obs, candidate_results = process_candidates(
+        new_obs, updated_obs, vocab_count, exemplar_count, candidate_results = process_candidates(
             conn, session_id, heartbeat_fn=heartbeat)
-        print(f"  New observations: {new_obs}, Updated: {updated_obs}")
+        print(f"  New observations: {new_obs}, Updated: {updated_obs}, Vocab: {vocab_count}, Exemplars: {exemplar_count}")
 
         if not heartbeat_claim(conn, session_id, token):
             conn.close()
             return False, "claim lost during candidate processing"
 
         # 3. Write session summary
-        summary = write_session_summary(session_id, reconciled, new_obs, updated_obs, candidate_results, conn)
+        summary = write_session_summary(session_id, reconciled, new_obs, updated_obs, vocab_count, exemplar_count, candidate_results, conn)
 
         # 4. Finalize: set real ended_at, clear claim — guarded by our token
         final_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -371,6 +517,12 @@ def end_session(session_id, db_path=None):
         subprocess.run([sys.executable, export_script] + db_arg, check=True)
         print("  Model regenerated")
 
+        # 6. Regenerate system prompt for twin chatbot
+        export_prompt_script = os.path.join(SCRIPTS_DIR, "export_prompt.py")
+        if os.path.exists(export_prompt_script):
+            subprocess.run([sys.executable, export_prompt_script], check=False)
+            print("  System prompt regenerated")
+
         return True, "finalized"
 
     except Exception as e:
@@ -382,7 +534,7 @@ def end_session(session_id, db_path=None):
         return False, f"processing error (claim retained for reclaim): {e}"
 
 
-def finalize_stale_sessions(db_path=None, max_age_minutes=5, claim_timeout_minutes=2):
+def finalize_stale_sessions(db_path=None, max_age_minutes=30, claim_timeout_minutes=2):
     """Find and finalize orphaned sessions.
 
     Two paths:
@@ -397,13 +549,14 @@ def finalize_stale_sessions(db_path=None, max_age_minutes=5, claim_timeout_minut
     unclaimed = conn.execute("""
         SELECT s.session_id FROM sessions s
         WHERE s.ended_at IS NULL AND s.finalizing_token IS NULL
+        AND s.started_at < ?
         AND (
             NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.session_id)
             OR (SELECT MAX(m.timestamp) FROM messages m
                 WHERE m.session_id = s.session_id) < ?
         )
         ORDER BY s.started_at ASC
-    """, (msg_cutoff,)).fetchall()
+    """, (msg_cutoff, msg_cutoff)).fetchall()
 
     # Path 2: Crashed claims (token set, ended_at IS NULL, heartbeat stale)
     crashed = conn.execute("""
@@ -447,7 +600,7 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--session", help="Session ID to finalize")
     group.add_argument("--all-stale", action="store_true", help="Finalize all stale sessions")
-    parser.add_argument("--max-age", type=int, default=5, help="Minutes since last message (default 5)")
+    parser.add_argument("--max-age", type=int, default=30, help="Minutes since last message (default 30)")
     parser.add_argument("--claim-timeout", type=int, default=2, help="Minutes before reclaiming stale claim (default 2)")
     parser.add_argument("--db", help="Override database path")
 
