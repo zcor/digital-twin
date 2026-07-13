@@ -49,6 +49,14 @@ IMPERSONATION_MIN_DIM = 0.50
 IMPERSONATION_MAX_CONTRADICTION = 0.10
 
 
+def require_unit(value, name="score"):
+    """Return a finite 0..1 score, rejecting corrupt or drifted inputs."""
+    value = float(value)
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} is outside 0..1: {value}")
+    return value
+
+
 def get_connection(db_path=None):
     db_path = db_path or DB_PATH
     conn = sqlite3.connect(db_path)
@@ -72,20 +80,28 @@ def count_contradiction_links(conn, obs_id):
 def observation_confidence(obs, contradiction_count, as_of=None):
     """Compute confidence for a single observation using the exact formula."""
     today = as_of or datetime.now(timezone.utc).date()
+    evidence_count = obs["evidence_count"]
+    if evidence_count < 0:
+        raise ValueError("evidence_count cannot be negative")
+    if contradiction_count < 0:
+        raise ValueError("contradiction_count cannot be negative")
 
     # Base: sigmoid on evidence count
-    b = 1.0 / (1.0 + math.exp(-0.5 * (obs["evidence_count"] - 5)))
+    b = 1.0 / (1.0 + math.exp(-0.5 * (evidence_count - 5)))
 
     # Recency: linear decay from last confirmation
     last_confirmed = datetime.strptime(obs["last_confirmed"][:10], "%Y-%m-%d").date()
     days = (today - last_confirmed).days
-    r = max(0.5, 1.0 - (days / 365) * 0.5)
+    r = min(1.0, max(0.5, 1.0 - (days / 365) * 0.5))
 
     # Consistency: penalty per active contradiction link
     c = max(0.2, 1.0 - 0.2 * contradiction_count)
 
     # Depth: from specificity enum
-    d = DEPTH_MAP.get(obs["specificity"], 0.6)
+    try:
+        d = DEPTH_MAP[obs["specificity"]]
+    except KeyError as error:
+        raise ValueError(f"invalid specificity: {obs['specificity']!r}") from error
 
     return round(b * r * c * d, 4)
 
@@ -95,33 +111,93 @@ def facet_confidence(observations_with_conf):
     if not observations_with_conf:
         return 0.0
     weights = [o["evidence_count"] for o in observations_with_conf]
-    scores = [o["computed_confidence"] for o in observations_with_conf]
+    if any(weight < 0 for weight in weights):
+        raise ValueError("evidence_count cannot be negative")
+    if not sum(weights):
+        return 0.0
+    scores = [
+        require_unit(o["computed_confidence"], "computed_confidence")
+        for o in observations_with_conf
+    ]
     return round(sum(s * w for s, w in zip(scores, weights)) / sum(weights), 4)
 
 
 def dimension_confidence(dimension, facet_scores):
     """Dimension confidence including coverage penalty."""
     expected = DIMENSION_FACET_COUNTS.get(dimension, 5)
-    observed = sum(1 for s in facet_scores.values() if s > 0)
+    validated_scores = [
+        require_unit(score, f"{dimension} facet confidence")
+        for score in facet_scores.values()
+    ]
+    bounded_scores = sorted(
+        (score for score in validated_scores if score > 0), reverse=True
+    )[:expected]
+    observed = len(bounded_scores)
     coverage = observed / expected
-    mean_score = sum(facet_scores.values()) / expected  # zeros for missing facets
-    return round(mean_score * coverage, 4)
+    mean_score = sum(bounded_scores) / expected  # zeros for missing facets
+    return round(require_unit(mean_score * coverage, "dimension confidence"), 4)
 
 
 def readiness_score(dim_scores, exemplar_ratio, contradiction_rate, vocab_score):
     """Overall impersonation readiness."""
     if not dim_scores:
+        raise ValueError("readiness requires dimension scores")
+    bounded_dims = [
+        require_unit(value, f"dimension {dimension}")
+        for dimension, value in dim_scores.items()
+    ]
+    exemplar_ratio = require_unit(exemplar_ratio, "exemplar_ratio")
+    contradiction_rate = require_unit(contradiction_rate, "contradiction_rate")
+    vocab_score = require_unit(vocab_score, "vocabulary_score")
+    if not any(bounded_dims):
         return 0.0
-    min_dim = min(dim_scores.values())
-    avg_dim = sum(dim_scores.values()) / len(dim_scores)
-    return round(
+    min_dim = min(bounded_dims)
+    avg_dim = sum(bounded_dims) / len(bounded_dims)
+    score = (
         0.25 * min_dim
         + 0.25 * avg_dim
         + 0.20 * exemplar_ratio
         + 0.15 * (1.0 - contradiction_rate)
-        + 0.15 * vocab_score,
-        4
+        + 0.15 * vocab_score
     )
+    return round(require_unit(score, "overall readiness"), 4)
+
+
+def validate_confidence_output(confidence):
+    """Fail closed if an exported confidence metric violates its declared range."""
+    paths = {
+        "overall_readiness": confidence.get("overall_readiness"),
+        "exemplar_ratio": confidence.get("exemplar_ratio"),
+        "contradiction_rate": confidence.get("contradiction_rate"),
+        "vocabulary_score": confidence.get("vocabulary_score"),
+    }
+    for dimension, values in confidence.get("per_dimension", {}).items():
+        paths[f"per_dimension.{dimension}.confidence"] = values.get("confidence")
+        paths[f"per_dimension.{dimension}.coverage"] = values.get("coverage")
+        paths[f"per_dimension.{dimension}.min_facet_confidence"] = values.get(
+            "min_facet_confidence"
+        )
+        for facet, score in values.get("facets", {}).items():
+            paths[f"per_dimension.{dimension}.facets.{facet}"] = score
+    invalid = []
+    schema_violations = confidence.get("schema_violations", [])
+    if not isinstance(schema_violations, list):
+        invalid.append("schema_violations must be a list")
+    elif schema_violations and (
+        confidence.get("ready_for_calibration")
+        or confidence.get("ready_for_impersonation")
+    ):
+        invalid.append("readiness cannot be true while schema violations exist")
+    for path, value in paths.items():
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            invalid.append(f"{path}={value!r}")
+            continue
+        if not math.isfinite(numeric) or not 0.0 <= numeric <= 1.0:
+            invalid.append(f"{path}={value!r}")
+    if invalid:
+        raise ValueError("confidence schema range violation: " + ", ".join(invalid))
 
 
 def export_model(db_path=None, model_dir=None, as_of=None):
@@ -208,8 +284,14 @@ def export_model(db_path=None, model_dir=None, as_of=None):
 
     dim_scores = {}
     per_dimension = {}
+    schema_violations = []
     for dim in VALID_DIMENSIONS:
         fs = facet_scores_by_dim[dim]
+        expected_facets = DIMENSION_FACET_COUNTS.get(dim, 5)
+        if len(fs) > expected_facets:
+            schema_violations.append(
+                f"{dim} has {len(fs)} facets; schema declares {expected_facets}"
+            )
         ds = dimension_confidence(dim, fs)
         dim_scores[dim] = ds
 
@@ -218,7 +300,16 @@ def export_model(db_path=None, model_dir=None, as_of=None):
 
         per_dimension[dim] = {
             "confidence": ds,
-            "coverage": round(sum(1 for s in fs.values() if s > 0) / DIMENSION_FACET_COUNTS.get(dim, 5), 4),
+            "declared_facets": expected_facets,
+            "observed_facets": len(fs),
+            "coverage": round(
+                min(
+                    sum(1 for score in fs.values() if score > 0)
+                    / DIMENSION_FACET_COUNTS.get(dim, 5),
+                    1.0,
+                ),
+                4,
+            ),
             "min_facet_confidence": round(min(fs.values(), default=0.0), 4),
             "contradiction_count": total_contradictions,
             "facets": {k: round(v, 4) for k, v in sorted(fs.items())},
@@ -226,16 +317,29 @@ def export_model(db_path=None, model_dir=None, as_of=None):
 
     # Exemplar ratio
     total_obs = len([o for o in obs_data if o["computed_confidence"] > 0.2])
-    obs_with_exemplars = conn.execute("""
-        SELECT COUNT(DISTINCT observation_id) FROM exemplars
-        WHERE observation_id IN (SELECT id FROM observations WHERE is_active = 1)
-    """).fetchone()[0]
+    exemplar_observation_ids = {
+        row[0]
+        for row in conn.execute(
+            """
+            SELECT DISTINCT observation_id FROM exemplars
+            WHERE observation_id IN (SELECT id FROM observations WHERE is_active = 1)
+            """
+        ).fetchall()
+    }
+    obs_with_exemplars = sum(
+        1
+        for observation in obs_data
+        if observation["computed_confidence"] > 0.2
+        and observation["id"] in exemplar_observation_ids
+    )
     exemplar_ratio = round(obs_with_exemplars / max(total_obs, 1), 4)
 
     # Contradiction rate
-    total_links = conn.execute("SELECT COUNT(*) FROM observation_links WHERE link_type = 'contradicts'").fetchone()[0]
     total_active_obs = len(obs_data)
-    contradiction_rate = round(total_links / max(total_active_obs, 1), 4)
+    contradictory_obs = sum(
+        1 for observation in obs_data if observation["contradiction_count"] > 0
+    )
+    contradiction_rate = round(contradictory_obs / max(total_active_obs, 1), 4)
 
     # Vocabulary score
     vocab_count = conn.execute("SELECT COUNT(*) FROM vocabulary").fetchone()[0]
@@ -252,6 +356,7 @@ def export_model(db_path=None, model_dir=None, as_of=None):
 
     if contradiction_rate >= CALIBRATION_MAX_CONTRADICTION:
         blocking_reasons.append(f"Contradiction rate {contradiction_rate:.2f} >= {CALIBRATION_MAX_CONTRADICTION:.2f}")
+    blocking_reasons.extend(f"Facet schema mismatch: {reason}" for reason in schema_violations)
 
     sorted_dims = sorted(dim_scores.items(), key=lambda x: x[1])
     weakest = [d[0] for d in sorted_dims[:3]]
@@ -267,10 +372,22 @@ def export_model(db_path=None, model_dir=None, as_of=None):
         "exemplar_ratio": exemplar_ratio,
         "contradiction_rate": contradiction_rate,
         "vocabulary_score": vocab_score,
-        "ready_for_calibration": overall >= CALIBRATION_READINESS and all(d >= CALIBRATION_MIN_DIM for d in dim_scores.values()) and contradiction_rate < CALIBRATION_MAX_CONTRADICTION,
-        "ready_for_impersonation": overall >= IMPERSONATION_READINESS and all(d >= IMPERSONATION_MIN_DIM for d in dim_scores.values()) and contradiction_rate < IMPERSONATION_MAX_CONTRADICTION,
+        "schema_violations": schema_violations,
+        "ready_for_calibration": (
+            not schema_violations
+            and overall >= CALIBRATION_READINESS
+            and all(d >= CALIBRATION_MIN_DIM for d in dim_scores.values())
+            and contradiction_rate < CALIBRATION_MAX_CONTRADICTION
+        ),
+        "ready_for_impersonation": (
+            not schema_violations
+            and overall >= IMPERSONATION_READINESS
+            and all(d >= IMPERSONATION_MIN_DIM for d in dim_scores.values())
+            and contradiction_rate < IMPERSONATION_MAX_CONTRADICTION
+        ),
         "blocking_reasons": blocking_reasons,
     }
+    validate_confidence_output(confidence_out)
 
     # --- Build gaps.json ---
     gaps_rows = conn.execute("""
@@ -287,7 +404,7 @@ def export_model(db_path=None, model_dir=None, as_of=None):
                 "dimension": g["dimension"],
                 "facet": g["facet"],
                 "description": g["description"],
-                "priority": round(g["priority"], 4),
+                "priority": round(require_unit(g["priority"], "gap priority"), 4),
                 "suggested_approaches": json.loads(g["suggested_approaches"]) if g["suggested_approaches"] else None,
                 "state": "partially_known" if g["status"] == "partially_addressed" else "unknown",
                 "confidence_rationale": f"Gap in {g['dimension']}/{g['facet'] or 'general'}: {g['description']}",
@@ -319,11 +436,12 @@ def generate_empty_model(model_dir, as_of=None):
 
     personality_out = {"generated_at": now_utc, "schema_version": 1, "dimensions": personality}
 
-    dim_scores = {dim: 0.0 for dim in VALID_DIMENSIONS}
     per_dimension = {}
     for dim in VALID_DIMENSIONS:
         per_dimension[dim] = {
             "confidence": 0.0,
+            "declared_facets": DIMENSION_FACET_COUNTS[dim],
+            "observed_facets": 0,
             "coverage": 0.0,
             "min_facet_confidence": 0.0,
             "contradiction_count": 0,
@@ -340,10 +458,12 @@ def generate_empty_model(model_dir, as_of=None):
         "exemplar_ratio": 0.0,
         "contradiction_rate": 0.0,
         "vocabulary_score": 0.0,
+        "schema_violations": [],
         "ready_for_calibration": False,
         "ready_for_impersonation": False,
         "blocking_reasons": [f"{dim} dimension at 0.00, needs >= 0.30 for calibration" for dim in VALID_DIMENSIONS],
     }
+    validate_confidence_output(confidence_out)
 
     gaps_out = {
         "generated_at": now_utc,
