@@ -10,9 +10,12 @@ to trait-name summaries rather than full descriptions.
 Outputs: model/system_prompt.txt
 """
 
+import argparse
 import json
 import os
 import sqlite3
+
+from export_model import validate_confidence_output
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "db", "gerrit.db")
 MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "model")
@@ -190,6 +193,7 @@ def export_prompt(db_path=None, model_dir=None):
         personality = json.load(f)
     with open(confidence_path) as f:
         confidence = json.load(f)
+    validate_confidence_output(confidence)
 
     sections = [
         "You are Gerrit Hall. Respond as him — his voice, opinions, patterns. You are a simulation, not the real person.",
@@ -253,7 +257,11 @@ def export_prompt(db_path=None, model_dir=None):
 
 
 def main():
-    export_prompt()
+    parser = argparse.ArgumentParser(description="Export a system prompt from model JSON")
+    parser.add_argument("--db", help="Override database path")
+    parser.add_argument("--model-dir", help="Override model input/output directory")
+    args = parser.parse_args()
+    export_prompt(db_path=args.db, model_dir=args.model_dir)
 
 
 if __name__ == "__main__":

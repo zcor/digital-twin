@@ -28,6 +28,11 @@ Personality is modeled across seven dimensions, each with multiple facets:
 
 Each observation has a computed confidence score: `sigmoid(evidence) × recency × consistency × depth`.
 
+> **Private research boundary:** generated model files may contain sensitive interview material.
+> They are not public deployment artifacts. Never expose `model/`, the transcript database, or an
+> exported prompt to a public chatbot. Readiness scores describe interview coverage only; public
+> release requires a separate, human-reviewed publication artifact and held-out safety evaluation.
+
 ## Architecture
 
 ```

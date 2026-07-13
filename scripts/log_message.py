@@ -93,10 +93,11 @@ def ensure_session(conn, session_id):
     return False
 
 
-def write_fallback(session_id, msg_uuid, role, timestamp, content):
+def write_fallback(session_id, msg_uuid, role, timestamp, content, transcripts_dir=None):
     """Write length-prefixed record to fallback transcript."""
-    os.makedirs(TRANSCRIPTS_DIR, exist_ok=True)
-    filepath = os.path.join(TRANSCRIPTS_DIR, f"{session_id}.txt")
+    transcripts_dir = transcripts_dir or TRANSCRIPTS_DIR
+    os.makedirs(transcripts_dir, exist_ok=True)
+    filepath = os.path.join(transcripts_dir, f"{session_id}.txt")
     content_bytes = content.encode("utf-8")
     byte_length = len(content_bytes)
     header = f"GERRIT_RECORD {msg_uuid} {role} {timestamp} {byte_length}\n"
@@ -177,7 +178,7 @@ def validate_candidate(candidate_json_str):
     return data, errors
 
 
-def log_message(role, session_id, content, msg_uuid=None, db_path=None):
+def log_message(role, session_id, content, msg_uuid=None, db_path=None, transcripts_dir=None):
     """Log a message to DB and fallback transcript. Returns (message_id, uuid, error)."""
     conn = get_connection(db_path)
     msg_uuid = msg_uuid or str(uuid_mod.uuid4())
@@ -221,7 +222,14 @@ def log_message(role, session_id, content, msg_uuid=None, db_path=None):
         msg_id = conn.execute("SELECT id FROM messages WHERE uuid = ?", (msg_uuid,)).fetchone()[0]
 
         # Write fallback
-        write_fallback(session_id, msg_uuid, role, now, content)
+        write_fallback(
+            session_id,
+            msg_uuid,
+            role,
+            now,
+            content,
+            transcripts_dir=transcripts_dir,
+        )
 
         conn.close()
         return msg_id, msg_uuid, None
@@ -278,6 +286,7 @@ def main():
     parser.add_argument("--observation-candidate", action="store_true", help="Log observation candidate instead of message")
     parser.add_argument("--set-dev-mode", action="store_true", help="Enable dev mode for session (must be first message)")
     parser.add_argument("--db", help="Override database path")
+    parser.add_argument("--transcripts-dir", help="Override fallback transcript directory")
 
     args = parser.parse_args()
 
@@ -330,7 +339,14 @@ def main():
                 print(json.dumps({"error": f"Invalid UUID format: {msg_uuid}"}))
                 sys.exit(1)
 
-        msg_id, msg_uuid, error = log_message(args.role, args.session, content, msg_uuid=msg_uuid, db_path=args.db)
+        msg_id, msg_uuid, error = log_message(
+            args.role,
+            args.session,
+            content,
+            msg_uuid=msg_uuid,
+            db_path=args.db,
+            transcripts_dir=args.transcripts_dir,
+        )
         if error:
             print(json.dumps({"error": error}))
             sys.exit(1)

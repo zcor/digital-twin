@@ -13,7 +13,7 @@ def observation_confidence(obs, as_of=None):
 
     # Recency: linear decay from last confirmation
     days = (today - obs.last_confirmed).days
-    r = max(0.5, 1.0 - (days / 365) * 0.5)
+    r = min(1.0, max(0.5, 1.0 - (days / 365) * 0.5))
 
     # Consistency: penalty per active contradiction link
     contradiction_count = count_links(obs.id, 'contradicts')
@@ -62,16 +62,29 @@ DIMENSION_FACET_COUNTS = {
 
 def dimension_confidence(dimension, facet_scores):
     expected = DIMENSION_FACET_COUNTS[dimension]
-    observed = sum(1 for s in facet_scores.values() if s > 0)
+    bounded = sorted(validate_unit_scores(facet_scores), reverse=True)[:expected]
+    observed = len(bounded)
     coverage = observed / expected
-    mean_score = sum(facet_scores.values()) / expected  # zeros for missing
+    mean_score = sum(bounded) / expected  # zeros for missing
     return round(mean_score * coverage, 4)
 ```
 
 ## Impersonation Readiness
 
+Every component and emitted aggregate is validated in the inclusive range `0..1`.
+Facet-count overflow is emitted as a schema violation and blocks readiness,
+while the numeric score remains bounded. Exemplar ratio counts only visible
+observations, and contradiction rate is the fraction of active observations with at
+least one contradiction. Export fails closed on a non-finite or out-of-range score.
+
+This readiness value is an interview-coverage heuristic. It is not a publication
+approval, an impersonation-quality measurement, or a substitute for a held-out,
+human-reviewed evaluation.
+
 ```python
 def readiness(dim_scores, exemplar_ratio, contradiction_rate, vocab_score):
+    if not any(dim_scores.values()):
+        return 0.0  # Absence of contradictions is not evidence in an empty model.
     return round(
         0.25 * min(dim_scores.values())
       + 0.25 * (sum(dim_scores.values()) / len(dim_scores))

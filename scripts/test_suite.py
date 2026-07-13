@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Automated test suite for Gerrit Digital Twin system.
 
-15 tests covering schema, logging, dedup, export, confidence, contradictions,
+28 tests covering schema, logging, dedup, export, confidence, contradictions,
 reconciliation, candidate validation, concurrency, impersonation guards,
 file permissions, calibration sanity, and FK enforcement.
 
 Usage: python3 scripts/test_suite.py
 """
 
+import hashlib
 import json
 import math
 import multiprocessing
@@ -27,12 +28,51 @@ PROJECT_DIR = os.path.dirname(SCRIPTS_DIR)
 # Import our modules
 sys.path.insert(0, SCRIPTS_DIR)
 from init_db import init_db
-from log_message import log_message, log_candidate, get_connection, validate_candidate, write_fallback
-from export_model import export_model, observation_confidence, DEPTH_MAP
+from log_message import (
+    log_message as production_log_message,
+    log_candidate,
+    get_connection,
+    validate_candidate,
+    write_fallback,
+)
+from export_model import (
+    export_model,
+    observation_confidence,
+    dimension_confidence,
+    readiness_score,
+    validate_confidence_output,
+    DEPTH_MAP,
+)
 from session_end import parse_fallback_file, reconcile, process_candidates, end_session, finalize_stale_sessions, heartbeat_claim
 
 PASS = 0
 FAIL = 0
+
+
+def log_message(*args, **kwargs):
+    """Force every test fallback transcript under its temporary DB root."""
+    db_path = kwargs.get("db_path")
+    if db_path and "transcripts_dir" not in kwargs:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(db_path)))
+        kwargs["transcripts_dir"] = os.path.join(root, "transcripts", "fallback")
+    return production_log_message(*args, **kwargs)
+
+
+def project_artifact_manifest():
+    """Hash real project artifacts so the suite can prove it did not touch them."""
+    manifest = []
+    for dirname in ("db", "model", "transcripts"):
+        root = os.path.join(PROJECT_DIR, dirname)
+        if not os.path.isdir(root):
+            continue
+        for current_root, _, filenames in os.walk(root):
+            for filename in sorted(filenames):
+                path = os.path.join(current_root, filename)
+                with open(path, "rb") as artifact:
+                    digest = hashlib.sha256(artifact.read()).hexdigest()
+                mode = os.stat(path).st_mode & 0o777
+                manifest.append((os.path.relpath(path, PROJECT_DIR), mode, digest))
+    return tuple(sorted(manifest))
 
 
 def report(name, passed, detail=""):
@@ -640,14 +680,87 @@ def test_calibration_sanity():
 
         result_high = export_model(db_path=db_path, model_dir=model_dir, as_of="2026-02-19")
         high_readiness = result_high["confidence"]["overall_readiness"]
+        schema_blocked = bool(result_high["confidence"]["schema_violations"])
+        schema_blocked = schema_blocked and not result_high["confidence"][
+            "ready_for_calibration"
+        ]
 
         conn.close()
 
         report("Calibration sanity",
-               low_readiness < med_readiness < high_readiness,
-               f"low={low_readiness:.4f} < med={med_readiness:.4f} < high={high_readiness:.4f}")
+               low_readiness < med_readiness < high_readiness and schema_blocked,
+               f"low={low_readiness:.4f} < med={med_readiness:.4f} < high={high_readiness:.4f}; schema_blocked={schema_blocked}")
     finally:
         cleanup(tmpdir)
+
+
+def test_score_range_guards():
+    empty_readiness = readiness_score(
+        {dimension: 0.0 for dimension in (
+            "communication_style",
+            "vocabulary_language",
+            "humor_wit",
+            "values_opinions",
+            "knowledge_expertise",
+            "emotional_relational",
+            "cognitive_decision_making",
+        )},
+        exemplar_ratio=0.0,
+        contradiction_rate=0.0,
+        vocab_score=0.0,
+    )
+    excessive_facets = {f"facet_{index}": 2.0 for index in range(20)}
+    bounded_overflow = dimension_confidence(
+        "humor_wit", {f"facet_{index}": 0.5 for index in range(20)}
+    )
+    rejected_dimension = False
+    rejected_readiness = False
+    rejected_output = False
+    rejected_nonfinite = False
+    try:
+        dimension_confidence("humor_wit", excessive_facets)
+    except ValueError:
+        rejected_dimension = True
+    try:
+        readiness_score(
+            {"one": 4.0, "two": -2.0},
+            exemplar_ratio=25.0,
+            contradiction_rate=-3.0,
+            vocab_score=10.0,
+        )
+    except ValueError:
+        rejected_readiness = True
+    try:
+        validate_confidence_output(
+            {
+                "overall_readiness": 5.45,
+                "exemplar_ratio": 25.64,
+                "contradiction_rate": 0.0,
+                "vocabulary_score": 1.0,
+                "per_dimension": {},
+            }
+        )
+    except ValueError:
+        rejected_output = True
+    try:
+        dimension_confidence("humor_wit", {"type": math.nan})
+    except ValueError:
+        rejected_nonfinite = True
+    report(
+        "Score range guards",
+        empty_readiness == 0.0
+        and 0.0 <= bounded_overflow <= 1.0
+        and rejected_dimension
+        and rejected_readiness
+        and rejected_output
+        and rejected_nonfinite,
+        (
+            f"empty={empty_readiness}, bounded_overflow={bounded_overflow}, "
+            f"dimension={rejected_dimension}, "
+            f"readiness={rejected_readiness}, "
+            f"output={rejected_output}, nonfinite={rejected_nonfinite} rejected"
+        ),
+    )
 
 
 # --- Test 15: FK constraint enforcement ---
@@ -1107,6 +1220,7 @@ def test_set_dev_mode_refused_mid_session():
 
 def main():
     global PASS, FAIL
+    artifact_manifest_before = project_artifact_manifest()
     print("\n=== Gerrit Digital Twin Test Suite ===\n")
 
     test_schema_idempotency()
@@ -1123,6 +1237,7 @@ def main():
     test_impersonation_guards()
     test_file_permissions()
     test_calibration_sanity()
+    test_score_range_guards()
     test_fk_enforcement()
 
     # New tests (16-25)
@@ -1136,6 +1251,11 @@ def main():
     test_dev_mode_guard()
     test_dev_mode_session_scoped()
     test_set_dev_mode_refused_mid_session()
+    report(
+        "Project artifact isolation",
+        project_artifact_manifest() == artifact_manifest_before,
+        "db/model/transcript manifest unchanged",
+    )
 
     print(f"\n{'='*40}")
     print(f"Results: {PASS} passed, {FAIL} failed, {PASS+FAIL} total")

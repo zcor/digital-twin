@@ -89,9 +89,10 @@ def parse_fallback_file(filepath):
     return records
 
 
-def reconcile(conn, session_id):
+def reconcile(conn, session_id, transcripts_dir=None):
     """Upsert fallback records into DB by UUID."""
-    fallback_path = os.path.join(TRANSCRIPTS_DIR, "fallback", f"{session_id}.txt")
+    transcripts_dir = transcripts_dir or TRANSCRIPTS_DIR
+    fallback_path = os.path.join(transcripts_dir, "fallback", f"{session_id}.txt")
     records = parse_fallback_file(fallback_path)
     reconciled = 0
 
@@ -345,9 +346,20 @@ def extract_topics(session_id, candidate_results, conn):
     return topics
 
 
-def write_session_summary(session_id, reconciled, new_obs, updated_obs, vocab_count, exemplar_count, candidate_results, conn):
+def write_session_summary(
+    session_id,
+    reconciled,
+    new_obs,
+    updated_obs,
+    vocab_count,
+    exemplar_count,
+    candidate_results,
+    conn,
+    transcripts_dir=None,
+):
     """Write session summary markdown and populate topics_covered."""
-    summaries_dir = os.path.join(TRANSCRIPTS_DIR, "summaries")
+    transcripts_dir = transcripts_dir or TRANSCRIPTS_DIR
+    summaries_dir = os.path.join(transcripts_dir, "summaries")
     os.makedirs(summaries_dir, exist_ok=True)
 
     msg_count = conn.execute("SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)).fetchone()[0]
@@ -416,11 +428,22 @@ def heartbeat_claim(conn, session_id, token):
     return cur.rowcount > 0
 
 
-def end_session(session_id, db_path=None):
+def end_session(session_id, db_path=None, transcripts_dir=None, model_dir=None):
     """Run full end-of-session processing with token+heartbeat claim.
 
     Returns (success: bool, reason: str).
     """
+    if db_path:
+        db_dir = os.path.dirname(os.path.abspath(db_path))
+        artifact_root = (
+            os.path.dirname(db_dir) if os.path.basename(db_dir) == "db" else db_dir
+        )
+        transcripts_dir = transcripts_dir or os.path.join(artifact_root, "transcripts")
+        model_dir = model_dir or os.path.join(artifact_root, "model")
+    else:
+        transcripts_dir = transcripts_dir or TRANSCRIPTS_DIR
+        model_dir = model_dir or os.path.join(os.path.dirname(SCRIPTS_DIR), "model")
+
     conn = get_connection(db_path)
     token = str(uuid_mod.uuid4())
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -460,7 +483,7 @@ def end_session(session_id, db_path=None):
         print(f"Processing session: {session_id}")
 
         # 1. Reconciliation
-        reconciled = reconcile(conn, session_id)
+        reconciled = reconcile(conn, session_id, transcripts_dir=transcripts_dir)
         print(f"  Reconciled {reconciled} messages from fallback")
 
         # Check for zero-message sessions after reconciliation
@@ -468,7 +491,7 @@ def end_session(session_id, db_path=None):
             "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
         ).fetchone()[0]
         session_row = conn.execute(
-            "SELECT mode, impersonation_enabled FROM sessions WHERE session_id = ?", (session_id,)
+            "SELECT mode FROM sessions WHERE session_id = ?", (session_id,)
         ).fetchone()
         if post_recon_msg_count == 0 and session_row["mode"] == "impersonation":
             print(f"\n  WARNING: Impersonation session {session_id} has ZERO messages logged.")
@@ -494,7 +517,17 @@ def end_session(session_id, db_path=None):
             return False, "claim lost during candidate processing"
 
         # 3. Write session summary
-        summary = write_session_summary(session_id, reconciled, new_obs, updated_obs, vocab_count, exemplar_count, candidate_results, conn)
+        summary = write_session_summary(
+            session_id,
+            reconciled,
+            new_obs,
+            updated_obs,
+            vocab_count,
+            exemplar_count,
+            candidate_results,
+            conn,
+            transcripts_dir=transcripts_dir,
+        )
 
         # 4. Finalize: set real ended_at, clear claim — guarded by our token
         final_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -513,15 +546,20 @@ def end_session(session_id, db_path=None):
 
         # 5. Only regenerate model if we successfully finalized
         export_script = os.path.join(SCRIPTS_DIR, "export_model.py")
-        db_arg = ["--db", db_path] if db_path else []
-        subprocess.run([sys.executable, export_script] + db_arg, check=True)
-        print("  Model regenerated")
+        export_args = ["--model-dir", model_dir]
+        if db_path:
+            export_args.extend(["--db", db_path])
+        subprocess.run([sys.executable, export_script] + export_args, check=True)
+        print(f"  Model regenerated at {model_dir}")
 
         # 6. Regenerate system prompt for twin chatbot
         export_prompt_script = os.path.join(SCRIPTS_DIR, "export_prompt.py")
         if os.path.exists(export_prompt_script):
-            subprocess.run([sys.executable, export_prompt_script], check=False)
-            print("  System prompt regenerated")
+            prompt_args = ["--model-dir", model_dir]
+            if db_path:
+                prompt_args.extend(["--db", db_path])
+            subprocess.run([sys.executable, export_prompt_script] + prompt_args, check=True)
+            print(f"  System prompt regenerated at {model_dir}")
 
         return True, "finalized"
 
